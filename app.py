@@ -3,14 +3,23 @@ from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 from pydub import AudioSegment
 import os
-import requests
 import logging
 import json
-from better_profanity import profanity  # Library for detecting foul language
+import ssl
+import warnings
+import whisper
+import torch
+from transformers import pipeline
+from better_profanity import profanity
+
+# Suppress unnecessary warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# Disable SSL verification for environments with SSL issues
+ssl._create_default_https_context = ssl._create_unverified_context
 
 # Load environment variables
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # Flask app initialization
 app = Flask(__name__)
@@ -22,260 +31,324 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 # Static folder for images
 app.static_folder = 'static'
 
-# HTML Template for the interface
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+
+# Language mapping for full names
+LANGUAGE_MAP = {
+    "ta": "Tamil",
+    "te": "Telugu",
+    "hi": "Hindi",
+    "en": "English",
+}
+
+# Function to map ratings to emojis
+def get_rating_emoji(rating):
+    if rating <= 3:
+        return "😟"
+    elif 4 <= rating <= 6:
+        return "😐"
+    elif 7 <= rating <= 8:
+        return "🙂"
+    elif 9 <= rating <= 10:
+        return "😍"
+    else:
+        return "🤔"  # Default emoji for unexpected cases
+
+# HTML Template for rendering
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Call Sentiment Analysis</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&display=swap" rel="stylesheet">
     <style>
         body {
-            background-image: url('{{ url_for('static', filename='background.jpg') }}');
+            font-family: 'Roboto', sans-serif;
+            background: url('{{ url_for('static', filename='background.jpg') }}') no-repeat center center fixed;
             background-size: cover;
-            background-attachment: fixed;
-            background-repeat: no-repeat;
-            background-position: center;
-            color: #333;
-            position: relative;
-            font-family: 'Arial', sans-serif;
+            margin: 0;
+            padding: 0;
+            color: white;
         }
-        .overlay {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background-color: rgba(255, 255, 255, 0.5); /* Subtle light overlay */
-            z-index: -1;
+
+        .navbar {
+            background: rgba(0, 0, 0, 0.8);
+            border-bottom: 3px solid #e94560;
+            padding: 1rem 2rem;
         }
-        .header {
-            position: fixed;
-            top: 20px;
-            left: 20px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            background-color: rgba(0, 0, 0, 0.6);
+
+        .navbar img {
+            height: 50px;
+            margin-right: 10px;
+        }
+
+        .navbar h1 {
+            font-size: 2rem;
+            font-weight: bold;
+            color: #e94560;
+            display: inline-block;
+            vertical-align: middle;
+        }
+
+        .hero {
+            text-align: center;
+            padding: 120px 20px;
+            background: rgba(0, 0, 0, 0.6);
+            color: white;
+            margin-bottom: 2rem;
+        }
+
+        .hero h1 {
+            font-size: 2.8rem;
+            margin-bottom: 20px;
+            font-weight: bold;
+            color: #e94560;
+        }
+
+        .hero p {
+            font-size: 1.2rem;
+        }
+
+        .main-container {
+            margin: 0 auto;
+            max-width: 960px;
+            padding: 2rem;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 15px;
+            box-shadow: 0px 8px 15px rgba(0, 0, 0, 0.6);
+        }
+
+        .btn-custom {
+            background-color: #e94560;
+            border: none;
             color: white;
             padding: 10px 20px;
-            border-radius: 15px;
-            font-size: 1.5rem;
-            box-shadow: 0px 4px 6px rgba(0, 0, 0, 0.2);
-            z-index: 1;
-        }
-        .header img {
-            height: 40px;
-            border-radius: 50%;
-        }
-        .intro {
-            margin-top: 100px;
-            text-align: center;
-            padding: 20px;
-            color: white;
-            text-shadow: 0 2px 4px rgba(0, 0, 0, 0.7);
-        }
-        .intro h1 {
-            font-size: 2.5rem;
-            font-weight: bold;
-        }
-        .intro p {
             font-size: 1.2rem;
-            margin-top: 10px;
+            font-weight: bold;
+            border-radius: 5px;
+            transition: all 0.3s ease-in-out;
         }
-        .card {
-            border-radius: 15px;
-            background-color: rgba(255, 255, 255, 0.9);
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-            margin-top: 20px;
+
+        .btn-custom:hover {
+            background-color: #ff5c7a;
+            transform: scale(1.05);
         }
-        .emoji {
-            font-size: 5rem;
+
+        .info-section {
+            display: flex;
+            gap: 20px;
+            margin-top: 2rem;
         }
-        .details {
-            display: none;
+
+        .info-box {
+            flex: 1;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 1.5rem;
+            border-radius: 10px;
+            box-shadow: 0px 6px 12px rgba(0, 0, 0, 0.5);
+            text-align: center;
+        }
+
+        .info-box h3 {
+            font-size: 1.5rem;
+            margin-bottom: 10px;
+            color: #e94560;
+        }
+
+        footer {
+            text-align: center;
+            padding: 1rem;
+            background: rgba(0, 0, 0, 0.8);
+            border-top: 3px solid #e94560;
+            color: white;
+            margin-top: 3rem;
+        }
+
+        footer a {
+            color: #e94560;
+            text-decoration: none;
+        }
+
+        footer a:hover {
+            text-decoration: underline;
         }
     </style>
 </head>
-<body>
-    <div class="overlay"></div>
 
-    <!-- Fixed Header -->
-    <div class="header">
-        <img src="{{ url_for('static', filename='header.jpg') }}" alt="Logo">
-        Call Sentiment Analysis
+<body>
+    <nav class="navbar">
+        <img src="{{ url_for('static', filename='header3.png') }}" alt="Logo">
+        <h1>Call Sentiment Analysis</h1>
+    </nav>
+
+    <div class="hero">
+        <h1>Empowering Your Customer Insights</h1>
+        <p>
+            Upload call recordings to analyze customer interactions, detect sentiments, and gain actionable insights that
+            improve customer experience and business outcomes.
+        </p>
     </div>
 
-    <div class="container mt-5">
-        <!-- Intro Section -->
-        <div class="intro">
-            <h1>Welcome to Call Sentiment Analysis</h1>
-            <p>Analyze customer interactions, detect sentiment, identify foul language, and gather actionable insights. Upload your call recording to begin!</p>
-        </div>
+    <div class="main-container">
+        <h2 class="text-center mb-4">Get Started with Sentiment Analysis</h2>
+        <p class="text-center">
+            Use our advanced AI-powered platform to analyze the emotional tone of conversations. Understand your
+            customers better, identify issues, and make data-driven decisions.
+        </p>
 
-        <div class="card shadow-lg mb-5">
-            <div class="card-header bg-primary text-white text-center">
-                <h3>Upload Your Audio for Analysis</h3>
+        <div class="card mt-4">
+            <div class="card-header text-center bg-danger text-white">
+                Upload Your Audio File
             </div>
             <div class="card-body">
                 <form action="/" method="post" enctype="multipart/form-data">
                     <div class="mb-3">
-                        <label for="audiofile" class="form-label">Choose an Audio File</label>
-                        <input type="file" name="audiofile" id="audiofile" accept="audio/*" class="form-control" required>
+                        <label for="audiofile" class="form-label">Choose an Audio File:</label>
+                        <input type="file" name="audiofile" id="audiofile" accept="audio/*" class="form-control"
+                            required>
                     </div>
                     <div class="text-center">
-                        <button type="submit" class="btn btn-success btn-lg">Analyze</button>
+                        <button type="submit" class="btn btn-custom">Analyze Now</button>
                     </div>
                 </form>
             </div>
         </div>
 
-        {% if analysis %}
-        <div class="card shadow-lg mb-5">
-            <div class="card-header bg-secondary text-white text-center">
-                <h3>Analysis Summary</h3>
+        <div class="info-section">
+            <div class="info-box">
+                <h3>Advanced AI Insights</h3>
+                <p>Leverage cutting-edge AI to gain actionable insights into customer sentiment and behavior.</p>
             </div>
-            <div class="card-body text-center">
-                <span class="emoji">{{ analysis['emoji'] }}</span>
-                <p class="text-muted mt-3">Overall Sentiment: {{ analysis['overall_sentiment'] }}</p>
-                <p class="text-muted mt-3">Detected Language: {{ analysis['language'] }}</p>
-                <p class="text-muted mt-3">Foul Language Used: {{ 'Yes' if analysis['foul_language_detected'] else 'No' }}</p>
-                <button class="btn btn-primary mt-3" onclick="toggleDetails()">Show More</button>
-                <div class="details mt-4">
-                    <h4>Speaker Identification:</h4>
-                    <ul>
-                        <li><strong>Speaker 1:</strong> {{ analysis['speaker_1'] }}</li>
-                        <li><strong>Speaker 2:</strong> {{ analysis['speaker_2'] }}</li>
-                    </ul>
-                    <h4>Sentiment Analysis:</h4>
-                    <h5>Speaker 1:</h5>
-                    <p>Initial Sentiment: {{ analysis['speaker_1_initial_sentiment'] }}</p>
-                    <p>Later Sentiment: {{ analysis['speaker_1_later_sentiment'] }}</p>
-                    <h5>Speaker 2:</h5>
-                    <p>Consistent Sentiment: {{ analysis['speaker_2_sentiment'] }}</p>
-                    <h4>Summary:</h4>
-                    <p>{{ analysis['summary'] }}</p>
-                    <h4>Recommendations:</h4>
-                    <p>{{ analysis['recommendations'] }}</p>
-                    <h4>Call Rating:</h4>
-                    <p>{{ analysis['rating'] }}/10</p>
+            <div class="info-box">
+                <h3>Foul Language Detection</h3>
+                <p>Identify offensive language in conversations to ensure professionalism and compliance.</p>
+            </div>
+            <div class="info-box">
+                <h3>Comprehensive Reports</h3>
+                <p>Receive detailed reports with sentiment analysis, ratings, and recommendations.</p>
+            </div>
+        </div>
+
+        {% if analysis %}
+        <div class="card mt-4">
+            <div class="card-header text-center bg-danger text-white">
+                Analysis Results
+            </div>
+            <div class="card-body">
+                <h3>Sentiment Emoticon:</h3>
+                <p>{{ analysis['chatgpt_analysis']['emoji'] }}</p>
+
+                <h3>Language Detected:</h3>
+                <p>{{ analysis['language'] }}</p>
+
+                <h3>Foul Language Detected:</h3>
+                <p>{{ 'Yes' if analysis['foul_language_detected'] else 'No' }}</p>
+
+                <h3>Call Rating:</h3>
+                <p>{{ analysis['chatgpt_analysis']['rating'] }}/10</p>
+
+                <div id="more-info" style="display: none;">
+                    <h3>Transcript:</h3>
+                    <p>{{ analysis['transcript'] }}</p>
+
+                    <h3>Overall Sentiment:</h3>
+                    <p>{{ analysis['chatgpt_analysis']['overall_sentiment'] }}</p>
+
+                    <h3>Recommendations:</h3>
+                    <p>{{ analysis['chatgpt_analysis']['recommendation'] }}</p>
                 </div>
+
+                <p class="show-more" onclick="document.getElementById('more-info').style.display='block'; this.style.display='none';">
+                    Show More
+                </p>
             </div>
         </div>
         {% endif %}
     </div>
-    <script>
-        function toggleDetails() {
-            const details = document.querySelector('.details');
-            details.style.display = details.style.display === 'block' ? 'none' : 'block';
-        }
-    </script>
+
+    <footer>
+        <p>&copy; 2024 Call Sentiment Analysis. <a href="#">Privacy Policy</a> | <a href="#">Terms of Use</a></p>
+    </footer>
 </body>
+
 </html>
+
 """
-
-
-
-# Helper function: Compress and convert audio
+# Compress and convert audio
 def compress_audio(audio_path, compressed_path):
     try:
         audio = AudioSegment.from_file(audio_path)
-        audio = audio.set_frame_rate(16000).set_channels(1)  # Mono audio, 16 kHz
+        audio = audio.set_frame_rate(16000).set_channels(1)
         audio.export(compressed_path, format="wav")
         return compressed_path
     except Exception as e:
         logging.error(f"Error compressing audio: {e}")
         raise
 
-# Helper function: Transcribe audio using Whisper API
-from langdetect import detect  # Import language detection library
+# Transcribe audio using Whisper
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+whisper_model = whisper.load_model("medium", device=device)
 
-# Helper function: Transcribe audio using Whisper API
-def transcribe_audio(file_path):
+def transcribe_audio(file_path, task="translate"):
     try:
-        with open(file_path, "rb") as audio_file:
-            response = requests.post(
-                "https://api.openai.com/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                files={"file": audio_file},
-                data={"model": "whisper-1"}
-            )
-        response.raise_for_status()
-        result = response.json()
-        transcript = result.get("text", "")
-        # Check if Whisper provides language metadata
-        detected_language = result.get("language", None)
-        
-        if not detected_language:
-            # Fallback to langdetect if language is not provided
-            detected_language = detect(transcript)
-        
-        return transcript, detected_language
+        result = whisper_model.transcribe(file_path, task=task)
+        transcript = result["text"]
+        language_code = result.get("language", "unknown")
+        language = LANGUAGE_MAP.get(language_code, "Unknown")
+        return transcript, language
     except Exception as e:
         logging.error(f"Error during transcription: {e}")
         raise
 
-
-# Helper function: Detect foul language
+# Detect foul language
 def detect_foul_language(transcript):
-    profanity.load_censor_words()  # Load default list of profane words
+    profanity.load_censor_words()
     return profanity.contains_profanity(transcript)
 
-# Helper function: Analyze transcript with ChatGPT
-def analyze_with_chatgpt(transcript):
+# Sentiment Analysis Pipeline using Hugging Face
+sentiment_pipeline = pipeline(
+    "sentiment-analysis", 
+    model="distilbert-base-uncased-finetuned-sst-2-english", 
+    device=0 if torch.cuda.is_available() else -1  # Use GPU if available
+)
+
+def analyze_transcript_locally(transcript):
     try:
-        prompt = f"""
-        Please analyze the following transcript in detail:
-        Transcript:
-        {transcript}
+        # Sentiment Analysis
+        sentiment_result = sentiment_pipeline(transcript[:512])  # Limit input size to 512 tokens
+        sentiment = sentiment_result[0]["label"].lower()
+        rating = 8 if sentiment == "positive" else (5 if sentiment == "neutral" else 3)
 
-        1. Identify and name the speakers based on their roles in the conversation.
-        2. Analyze the sentiment for each speaker (initial and later, if applicable) and explain the changes in tone.
-        3. Provide an overall summary of the call, emphasizing customer service quality and areas of improvement.
-        4. Offer actionable recommendations for improving similar calls.
-        5. Assign a professional rating to this call on a scale of 1 to 10.
-        6. Suggest a suitable emoji for the overall sentiment.
-
-        Output the results as a JSON object with the following keys:
-        - "speaker_1": A string describing the first speaker.
-        - "speaker_2": A string describing the second speaker.
-        - "speaker_1_initial_sentiment": Sentiment of speaker 1 initially.
-        - "speaker_1_later_sentiment": Sentiment of speaker 1 later.
-        - "speaker_2_sentiment": Sentiment of speaker 2.
-        - "summary": Overall summary of the conversation.
-        - "recommendations": Actionable recommendations.
-        - "rating": Rating of the call on a scale of 1 to 10.
-        - "emoji": A representative emoji for the overall sentiment.
-        """
-        response = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            json={
-                "model": "gpt-4",
-                "messages": [
-                    {"role": "system", "content": "You are an expert call center evaluator."},
-                    {"role": "user", "content": prompt}
-                ],
-            }
+        # Recommendation based on sentiment
+        recommendation = "Maintain good practices" if sentiment == "positive" else (
+            "Address customer concerns" if sentiment == "neutral" else "Improve call handling"
         )
-        response.raise_for_status()
-        return json.loads(response.json()["choices"][0]["message"]["content"])
-    except Exception as e:
-        logging.error(f"Error with ChatGPT API: {e}")
-        raise
 
-# Main route for uploading and analyzing audio
+        return {
+            "overall_sentiment": sentiment,
+            "recommendation": recommendation,
+            "rating": rating,
+            "emoji": get_rating_emoji(rating)
+        }
+    except Exception as e:
+        logging.error(f"Error analyzing transcript locally: {e}")
+        return {"error": "Failed to analyze transcript."}
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "POST":
         audio_file = request.files.get("audiofile")
-        if not audio_file or audio_file.filename == "":
+        if not audio_file:
+            logging.error("No audio file provided.")
             return render_template_string(HTML_TEMPLATE, analysis=None)
 
         try:
-            # Save and process the audio file
+            # Save and compress the uploaded file
             filename = secure_filename(audio_file.filename)
             file_path = os.path.join(UPLOAD_FOLDER, filename)
             audio_file.save(file_path)
@@ -283,16 +356,25 @@ def index():
             compressed_path = os.path.join(UPLOAD_FOLDER, f"compressed_{filename}")
             compress_audio(file_path, compressed_path)
 
-            # Transcribe the audio
-            transcript, language = transcribe_audio(compressed_path)
+            # Transcribe audio
+            transcript, language = transcribe_audio(compressed_path, task="translate")
+            if not transcript:
+                logging.error("Transcription returned empty text.")
+                return render_template_string(HTML_TEMPLATE, analysis=None)
 
             # Detect foul language
             foul_language_detected = detect_foul_language(transcript)
 
-            # Analyze the transcript with ChatGPT
-            analysis = analyze_with_chatgpt(transcript)
-            analysis['language'] = language
-            analysis['foul_language_detected'] = foul_language_detected
+            # Analyze transcript locally
+            analysis_result = analyze_transcript_locally(transcript)
+
+            # Build the analysis dictionary
+            analysis = {
+                "transcript": transcript,
+                "language": language,
+                "foul_language_detected": foul_language_detected,
+                "chatgpt_analysis": analysis_result,
+            }
 
             return render_template_string(HTML_TEMPLATE, analysis=analysis)
         except Exception as e:

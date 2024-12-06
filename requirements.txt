@@ -1,0 +1,9 @@
+Flask==2.3.3
+Werkzeug==2.3.7
+python-dotenv==1.0.0
+pydub==0.25.1
+torch==2.0.1  # Ensure compatibility with your GPU or CPU
+transformers==4.35.0
+better-profanity==0.4.1
+whisper==1.0  # From OpenAI's Whisper library
+requests==2.31.0

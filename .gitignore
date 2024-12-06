@@ -1,1 +1,9 @@
-.env
+# Ignore Python virtual environments
+.venv/
+
+# Ignore MacOS system files
+.DS_Store
+
+# Ignore all files in the uploads directory
+uploads/
+results/
